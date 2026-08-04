@@ -1,0 +1,8 @@
+github.com/pablo-botella/cargoxml v0.5.2 h1:A4KKLUXgeW8Vc1WVPs+DvZb/ODCuDWeKClvyhP0+cMI=
+github.com/pablo-botella/cargoxml v0.5.2/go.mod h1:q8uY6DQW7eTx2RuxTPfGbnoDks361idhJybuqQziCek=
+github.com/pablo-botella/fmlines v0.5.1 h1:1Qkv5ICxjnME2oaQJk0AYd6zQp07oTFrY9v62xj+izs=
+github.com/pablo-botella/fmlines v0.5.1/go.mod h1:0F+gaglE6tkE5cy6sgVD2/FpBrLlbv5xARAPRfkllAM=
+github.com/pablo-botella/linereader v0.5.1 h1:cs9WhKGwZ042uwsuKl99CuedfxEi9C4zuF8jFGWy7BU=
+github.com/pablo-botella/linereader v0.5.1/go.mod h1:vcKYM3kS+NF6IdDdOP/kNmYUWecNHntNeAzz0kXXvss=
+github.com/pablo-botella/mkskill v0.5.5 h1:aW+6Cb58N+8suxnhH6gRCob1e5XVDT6Fgt/xYsg7jY0=
+github.com/pablo-botella/mkskill v0.5.5/go.mod h1:dxULdBJUDKAhf01lcB5Bw3eZK/AxJi2szTrtxPr++Cw=

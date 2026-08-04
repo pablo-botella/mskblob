@@ -1,0 +1,88 @@
+# Release: runs when a v* tag lands, and only blesses tags that sit on
+# main. The gate regenerates the docs on a clean checkout (a stale
+# committed artifact fails the diff), then vets and tests. The release
+# job cross-compiles the six targets from one runner — pure Go, no cgo —
+# and refuses to publish unless the tag, the config's embedded version
+# and the binary's stamped build info all agree.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # full history: the tag-on-main check needs origin/main
+
+      - name: tag must be on main
+        run: |
+          git merge-base --is-ancestor HEAD origin/main || {
+            echo "::error::tag ${GITHUB_REF_NAME} is not on main"; exit 1; }
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: docs are fresh
+        # regenerate everything; if a COMMITTED artifact changes, someone
+        # edited _mkskill/ without running go generate — refuse the tag
+        run: |
+          go generate ./...
+          git diff --exit-code || {
+            echo "::error::generated docs are stale — run: go generate ./..."; exit 1; }
+
+      - run: go vet ./...
+      - run: go test ./...
+
+  release:
+    needs: verify
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # gh release create
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # tags included: go stamps bi.Main.Version from the tag
+          # NOTE: no `go generate` here — a dirty tree would stamp +dirty;
+          # the binaries embed the COMMITTED docs, which verify just proved fresh
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: cross-compile
+        env:
+          CGO_ENABLED: "0"
+        run: |
+          mkdir -p dist
+          for platform in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 windows/amd64 windows/arm64; do
+            export GOOS="${platform%/*}" GOARCH="${platform#*/}"
+            bin=mskblob; [ "$GOOS" = windows ] && bin=mskblob.exe
+            out="dist/${GOOS}_${GOARCH}"
+            mkdir -p "$out"
+            go build -trimpath -o "$out/$bin" ./cmd/mskblob
+            (cd "$out" && zip -q "../mskblob_${GOOS}_${GOARCH}.zip" "$bin")
+          done
+          (cd dist && sha256sum -- *.zip > checksums.txt)
+
+      - name: the three versions agree
+        # `mskblob version` prints "mskblob <embed> (<buildinfo>)": the
+        # config's release number and the stamped module version must both
+        # BE the tag — the mechanism's whole promise, enforced at the door
+        run: |
+          got="$(./dist/linux_amd64/mskblob version)"
+          echo "$got"
+          [ "$got" = "mskblob ${GITHUB_REF_NAME} (${GITHUB_REF_NAME})" ] || {
+            echo "::error::version mismatch: tag ${GITHUB_REF_NAME}, binary says: $got"; exit 1; }
+
+      - name: publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --verify-tag --generate-notes --title "$GITHUB_REF_NAME" \
+            dist/*.zip dist/checksums.txt
