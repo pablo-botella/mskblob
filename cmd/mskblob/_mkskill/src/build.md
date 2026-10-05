@@ -12,7 +12,25 @@ mskblob manifest -dir ./assets -include "*.png,*.jpg" -recurse -base ./assets -o
 mskblob create   -manifest img.json -out img.blob -base ./assets
 ```
 
-Relative `src` resolves against `-base` (default: the manifest's own dir). The guid is taken from `-id`, else the manifest's `id`, else freshly generated.
+Relative `src` resolves against `-base` (default: the manifest's own dir). The guid is taken from `-id`, else the manifest's `id`, else freshly generated. A source that is the output file itself is rejected — a blob cannot include itself.
+
+### A blob inside a blob
+
+An entry can hold another blob, so a whole tree ships as one file. Build bottom up, one `create` per level, and declare the inner one with `restype` **`mskblob,nomux`**, a `key` and no `url`:
+
+```
+mskblob create -manifest docs.json -out docs.blob   # the inner blob
+mskblob create -manifest site.json -out site.blob   # the container
+```
+
+```json
+[
+  { "url": "index.html", "src": "index.html" },
+  { "key": "/docs", "restype": "mskblob,nomux", "src": "docs.blob" }
+]
+```
+
+`mskblob` and `auto` are mskblob's own type flags, and whatever carries one is never served: such an entry **must** have a key, no url and `nomux` as well, or `create` refuses to build the blob. A nested blob is not reachable through its parent — `list` shows it as one more entry and `dump` extracts it as a file; to serve it, name it in the server config (see `internal_path` below).
 
 ### Skipping an unchanged rebuild
 

@@ -30,6 +30,8 @@ go install github.com/pablo-botella/mskblob/cmd/mskblob@latest    # CLI
 - Serving a large set of static assets without bloating the binary.
 - Reading / writing / inspecting `.blob` files.
 - Wiring the package into an app (load + access) or a build step (pack).
+- Shipping several independently built blobs as one file: a blob can hold another,
+  mounted in place with `OpenBlob` (see [Nested blobs](#nested-blobs-a-blob-inside-a-blob)).
 
 The package **lists and gives content** — it finds resources for you and streams
 their bytes; it does not own a web server. The internal layout (binary format,

@@ -12,7 +12,7 @@ mkskill:
 | `manifest` | Scan a directory into a reviewable JSON manifest |
 | `create` | Build a blob from a manifest |
 | `dump` | Extract a blob's asset files (all, or one by key with `-file`) |
-| `serve` | Serve one or more blobs over HTTP from a JSON config |
+| `serve` | Serve one or more blobs over HTTP from a JSON config — a file, or the one a blob carries inside |
 | `generate-claude-skill` | Generate the Claude Code `SKILL.md` |
 | `generate-agent-docs` | Generate the agent-agnostic `AGENTS.md` (Cursor, Aider, …) |
 

@@ -14,6 +14,7 @@ mkskill:
 | **GUID** | A random RFC-4122 v4 id stamped in the header. The sync token: a loader can demand the blob's id match what it was built against. |
 | **Base** | The URL prefix a blob is mounted under. Entry URLs are stored **relative** to it; `Handler(base)` strips the base before lookup. |
 | **Sealed index** | Lookups go through the in-memory index only. A path that isn't a packed entry is a 404 — there is no filesystem access and no traversal. |
+| **Nested blob** | An entry whose bytes are themselves a blob (`restype: mskblob,nomux`, key-only). `OpenBlob` mounts it in place over its section of the parent — same format, one level in — so a whole tree of blobs ships as a single file. |
 
 A blob is **not updatable in place**. To change one: `dump` it to a directory
 (`-manifest` to get the manifest too), edit, then `create` a fresh blob. It was

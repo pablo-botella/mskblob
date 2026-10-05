@@ -29,11 +29,16 @@ One JSON shape is used everywhere — `create` reads it; `manifest`, `dump` and
 }
 ```
 
-- **Declarative** (`url`, `src`, `key`, `filename`, `restype`) — what to pack. `url`
-  and `src` are required to build; the rest optional (`filename` defaults to `url`,
-  `restype` to `static`).
-- **`restype`** is a human flag mask: comma-separated names `static,tpl,parse,rsp,nomux`
-  (empty = none). On input a hex/decimal value (`"0x05"`, `5`) is also accepted.
+- **Declarative** (`url`, `src`, `key`, `filename`, `restype`) — what to pack. `src` is
+  required to build, plus at least one of `url`/`key`; the rest optional (`filename`
+  defaults to `url`, `restype` to `static`).
+- **`restype`** is a human flag mask: comma-separated names
+  `static,tpl,parse,rsp,nomux,mskblob,auto` (empty = none). On input a hex/decimal value
+  (`"0x05"`, `5`) is also accepted. A nested blob is
+  `{"key": "/img", "restype": "mskblob,nomux", "src": "dist/img.blob"}` — key, no url,
+  `nomux`, and a `.blob` as source; each level has its own manifest, built bottom up.
+  `mskblob` and `auto` are mskblob's own flags: an entry carrying one **must** have a
+  key, no url and `nomux`, or the blob is not written.
 - **Header** — `id`, `count` and `nocase` are always present (the shape is
   consistent even for a freshly-scanned manifest); `version`/`dataCRC32` appear only
   once a blob is built. `id` and `nocase` are read on build (id pins the guid,
@@ -59,3 +64,8 @@ BLOCK D — data: concatenated bytes at dataOffset; each entry's offset is the
 Every entry carries its full identity, so the blob is self-describing: it can be
 inspected and served on its own, and its header alone is enough to verify a
 deployed file (via the GUID).
+
+Nesting adds nothing to this: a container is a normal blob, and the child is the
+same format read over its own section — its `dataOffset` and entry offsets are
+relative to itself, so it is valid wherever it sits and can be copied in or out
+byte for byte. The only absolute number is the one the reader adds while mounting.

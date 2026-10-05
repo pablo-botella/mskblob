@@ -43,7 +43,8 @@ The blob is a **sub-mux**: you register only the base on your own mux and
 (`nil` middleware) serves **only static** entries — streamed **lazily** from the
 file (nothing resident in RAM, vital for a 245 MB image set), with `ETag` = crc32
 (`If-None-Match` → `304`) and a `Content-Type` by extension. Anything else (a
-template, or an unknown URL) is treated as if it weren't there → `404`.
+template, or an unknown URL) is treated as if it weren't there → `404`. An entry
+flagged `nomux` is never routed at all — reach it by key.
 
 To do more, pass a **middleware** — one hook called for every request with the
 matched item (`nil` when the URL is absent, so it can answer unknown routes too).

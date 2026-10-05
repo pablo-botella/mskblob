@@ -17,7 +17,8 @@
 //   - manifest               Scan a directory into a reviewable JSON manifest.
 //   - create                 Build a blob from a manifest.
 //   - dump                   Round-trip a blob back to files + manifest.json.
-//   - serve                  Serve one or more blobs over HTTP from a JSON config.
+//   - serve                  Serve one or more blobs over HTTP from a JSON config:
+//     a file, or the one a blob carries inside.
 //   - generate-claude-skill  Generate the Claude Code SKILL.md from the ai/ sources.
 //   - generate-agent-docs    Generate the agent-agnostic AGENTS.md (Cursor, Aider, etc.).
 //
@@ -32,7 +33,7 @@
 //	create    -manifest <f> -out <blob> [-dir srcdir] [-id guid] [-base d] [-nocase] [-strict] [-skip-unchanged]
 //	dump      -blob <file> -baseout <dir> [-manifest f]   (full extraction)
 //	dump      -blob <file> -file <key> (-baseout d | -out f | -stdout)   (one entry)
-//	serve     -config <file>
+//	serve     -config <file> | -auto <blob>
 //	generate-claude-skill [-dst f] [-global] [-force]
 //	generate-agent-docs   [-dst f] [-force]
 //
@@ -52,6 +53,7 @@ package main
 
 import (
 	"bytes"
+	"crypto/tls"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -59,6 +61,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"path"
 	"path/filepath"
 	"runtime/debug"
 	"sort"
@@ -555,14 +558,34 @@ func parseListManifest(data []byte) []mskblob.Item {
 	return items
 }
 
-// dumpRel is the on-disk subpath for an entry: its url (or key when url-less), as a
-// clean relative path. Mirrors how full extraction lays files out under -baseout.
+// dumpRel is the on-disk subpath for an entry: its url (or key when url-less, as a
+// nested blob or a template is), cleaned into a relative path. Both extraction
+// modes lay files out with it, so they agree on where an entry lands.
 func dumpRel(it *mskblob.Item) string {
 	s := it.URL
 	if s == "" {
 		s = it.Key
 	}
-	return filepath.FromSlash(strings.TrimPrefix(s, "/"))
+	if s = strings.TrimPrefix(s, "/"); s == "" {
+		return ""
+	}
+	return filepath.Clean(filepath.FromSlash(s))
+}
+
+// unsafeRel reports whether a subpath cannot be written under a base dir: empty
+// (it would be the dir itself), absolute, or climbing out of it.
+func unsafeRel(rel string) bool {
+	return rel == "" || rel == ".." || filepath.IsAbs(rel) ||
+		strings.HasPrefix(rel, ".."+string(filepath.Separator))
+}
+
+// entryName is what to call an entry in a message: its url, or its key when it has
+// no url.
+func entryName(it *mskblob.Item) string {
+	if it.URL != "" {
+		return it.URL
+	}
+	return it.Key
 }
 
 // isDirLike reports whether p should be treated as a directory destination: it ends
@@ -636,13 +659,16 @@ func cmdDump(args []string) error {
 		var p string
 		switch {
 		case *dst != "": // under the base dir, preserving the entry's subpath
-			if rel == "" || strings.HasPrefix(rel, ".."+string(filepath.Separator)) || filepath.IsAbs(rel) {
+			if unsafeRel(rel) {
 				return fmt.Errorf("dump: refusing unsafe entry path for %q (would escape %q)", *file, *dst)
 			}
 			p = filepath.Join(*dst, rel)
 		default: // -out: a file path, or a directory if it ends in a separator / already is one
 			p = *outFile
 			if isDirLike(*outFile) {
+				if unsafeRel(rel) {
+					return fmt.Errorf("dump: entry %q has no name to append to the directory %q; give -out a file path", *file, *outFile)
+				}
 				p = filepath.Join(*outFile, filepath.Base(rel))
 			}
 		}
@@ -672,11 +698,13 @@ func cmdDump(args []string) error {
 	for _, it := range items {
 		data, err := b.Bytes(&it)
 		if err != nil {
-			return fmt.Errorf("dump: reading entry %q: %w", it.URL, err)
+			return fmt.Errorf("dump: reading entry %q: %w", entryName(&it), err)
 		}
-		rel := filepath.FromSlash(it.URL)
-		if strings.HasPrefix(rel, ".."+string(filepath.Separator)) || filepath.IsAbs(rel) {
-			return fmt.Errorf("dump: refusing unsafe entry path %q (would escape %q)", it.URL, *dst)
+		// Key-only entries (a template, a nested blob) land at their key: taking the
+		// url alone would leave them with no name and write over the base dir itself.
+		rel := dumpRel(&it)
+		if unsafeRel(rel) {
+			return fmt.Errorf("dump: refusing unsafe entry path %q (would escape %q)", entryName(&it), *dst)
 		}
 		p := filepath.Join(*dst, rel)
 		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
@@ -687,7 +715,7 @@ func cmdDump(args []string) error {
 		}
 		// the manifest's src points at the file just written (relative to dst)
 		mi := it
-		mi.Src = it.URL
+		mi.Src = filepath.ToSlash(rel)
 		manifestItems = append(manifestItems, mi)
 	}
 
@@ -708,6 +736,10 @@ func cmdDump(args []string) error {
 // serveConfig is the JSON that drives `mskblob serve`: a web server mounting one
 // or more blobs, each under its own base. Variables live at two levels — global
 // and per-blob — and merge (the blob's win) for template rendering.
+//
+// A blob nested inside a file is served by naming it: internal_path lists the keys
+// to descend through, outermost first. It is an array rather than one string
+// because keys may themselves contain slashes.
 type serveConfig struct {
 	Addr    string         `json:"addr"`
 	TLS     *tlsConfig     `json:"tls"`
@@ -716,9 +748,16 @@ type serveConfig struct {
 	Blobs   []blobMount    `json:"blobs"`
 }
 
+// tlsConfig turns HTTPS on. Where cert and key point depends on who loaded the
+// configuration: paths on disk when it came from a file (-config), keys of entries
+// of the blob itself — under /mskblob/, flagged "auto,nomux" — when the blob
+// carried it (-auto). The key may be an encrypted PKCS#8; its password is never
+// here, only where to find it.
 type tlsConfig struct {
-	Cert string `json:"cert"`
-	Key  string `json:"key"`
+	Cert         string `json:"cert"`
+	Key          string `json:"key"`
+	PasswordFile string `json:"password_file"` // file holding the key's password; wins over password_env
+	PasswordEnv  string `json:"password_env"`  // name of the environment variable holding it
 }
 
 type headerKV struct {
@@ -727,11 +766,17 @@ type headerKV struct {
 }
 
 type blobMount struct {
-	File    string         `json:"file"`
-	Base    string         `json:"base"`
-	ID      string         `json:"id"`      // optional: verified on load
-	Vars    map[string]any `json:"vars"`    // per-blob variables (override the global ones)
-	Headers []headerKV     `json:"headers"` // per-blob extra headers (override the global ones)
+	File         string         `json:"file"`          // empty only inside a blob (serve -auto): that same blob
+	InternalPath []string       `json:"internal_path"` // optional: keys to descend through, one nested blob each; empty = the file itself
+	Base         string         `json:"base"`
+	ID           string         `json:"id"`      // optional: verified on load, against the blob finally mounted
+	Vars         map[string]any `json:"vars"`    // per-blob variables (override the global ones)
+	Headers      []headerKV     `json:"headers"` // per-blob extra headers (override the global ones)
+
+	// What to try when the requested URL is not an entry. Both are off unless
+	// declared: a mount that names neither serves exact matches only.
+	RemoveExtensions []string `json:"remove_extensions"` // "/about" or "/about/" also finds "about" + each of these, in order
+	DefaultDocument  []string `json:"default_document"`  // "/" or "/docs/" also finds each of these inside the folder, in order
 }
 
 // cmdServe runs the web server described by a JSON config: it mounts every blob
@@ -740,47 +785,149 @@ type blobMount struct {
 // extra headers to every response. Serves over TLS when tls.cert/tls.key are set.
 func cmdServe(args []string) error {
 	if len(args) == 0 {
-		fmt.Println("usage: mskblob serve -config <config.json>\n\n" +
+		fmt.Println("usage: mskblob serve -config <config.json>\n" +
+			"       mskblob serve -auto <file.blob>\n\n" +
 			"Serves one or more blobs over HTTP from a JSON config:\n" +
 			`  {"addr":":8080","tls":{"cert":"","key":""},"vars":{},"headers":[{"name":"","value":""}],` + "\n" +
 			`   "blobs":[{"file":"x.blob","base":"/","id":"","vars":{},"headers":[]}]}` + "\n" +
-			"Static entries stream lazily; templates render with the merged (global+blob) vars.")
+			"Static entries stream lazily; templates render with the merged (global+blob) vars.\n" +
+			`To serve a blob nested in the file add "internal_path":["/key","/key2"]: the keys to` + "\n" +
+			`descend through, outermost first. "id" then checks the blob finally mounted.` + "\n\n" +
+			"-config: the config is the entry point and names the blobs to open.\n" +
+			"-auto:   the blob is the entry point and carries its own config, in the entry with\n" +
+			"         key " + autoConfigKey + ` flagged "nomux,auto". There an empty "file"` + "\n" +
+			"         means that same blob. The two flags cannot be combined: nothing is merged.\n\n" +
+			`Per mount, optional: "default_document":["index.html"] answers "/" and "/dir/";` + "\n" +
+			`"remove_extensions":[".html"] answers "/about" with about.html. Off unless declared.` + "\n" +
+			`HTTPS: "tls":{"cert":..,"key":..} are paths on disk with -config, and keys of entries` + "\n" +
+			`under /mskblob/ flagged "auto,nomux" with -auto. An encrypted key (PKCS#8) takes its` + "\n" +
+			`password from "password_file" or the variable named by "password_env".`)
 		return nil
 	}
 	fs := flag.NewFlagSet("serve", flag.ContinueOnError)
 	config := fs.String("config", "", "JSON config file describing the server and blobs")
+	auto := fs.String("auto", "", "blob to serve from the configuration it carries inside")
 	if err := parseFlags(fs, args); err != nil {
 		return err
 	}
-	if *config == "" {
-		return missingFlag("serve", "-config <config.json>")
+	if *config != "" && *auto != "" {
+		return fmt.Errorf("serve: -config and -auto cannot be combined (nothing is merged): use -config to serve from "+
+			"that file alone, or -auto to serve %q from the configuration it carries", *auto)
 	}
-	raw, err := os.ReadFile(*config)
-	if err != nil {
-		return fmt.Errorf("serve: cannot read config %q: %w", *config, err)
-	}
-	var cfg serveConfig
-	if err := json.Unmarshal(raw, &cfg); err != nil {
-		return fmt.Errorf("serve: invalid JSON in config %q: %w", *config, err)
-	}
-	if len(cfg.Blobs) == 0 {
-		return fmt.Errorf("serve: config %q lists no blobs (need at least one in \"blobs\")", *config)
+	if *config == "" && *auto == "" {
+		return missingFlag("serve", "-config <config.json> (or -auto <file.blob>)")
 	}
 
+	var (
+		cfg    serveConfig
+		self   *mskblob.Blob // -auto: the blob the configuration came out of
+		origin string        // what to call the configuration in a message
+	)
+	if *auto != "" {
+		b, err := mskblob.Open(*auto)
+		if err != nil {
+			return fmt.Errorf("serve: opening blob %q: %w", *auto, err)
+		}
+		defer b.Close()
+		if cfg, err = loadAutoConfig(b); err != nil {
+			return fmt.Errorf("serve: blob %q: %w", *auto, err)
+		}
+		self, origin = b, fmt.Sprintf("the configuration inside %q", *auto)
+	} else {
+		raw, err := os.ReadFile(*config)
+		if err != nil {
+			return fmt.Errorf("serve: cannot read config %q: %w", *config, err)
+		}
+		if err := json.Unmarshal(raw, &cfg); err != nil {
+			return fmt.Errorf("serve: invalid JSON in config %q: %w", *config, err)
+		}
+		origin = fmt.Sprintf("config %q", *config)
+	}
+	if len(cfg.Blobs) == 0 {
+		return fmt.Errorf("serve: %s lists no blobs (need at least one in \"blobs\")", origin)
+	}
+
+	cert, err := loadTLS(cfg.TLS, self)
+	if err != nil {
+		return fmt.Errorf("serve: %s: %w", origin, err)
+	}
+
+	mux, closeBlobs, err := mountBlobs(cfg, self, *auto)
+	if err != nil {
+		return err
+	}
+	defer closeBlobs()
+
+	addr := cfg.Addr
+	if addr == "" {
+		addr = ":8080"
+	}
+	handler := withHeaders(mux, cfg.Headers)
+	if cert != nil {
+		fmt.Printf("serving HTTPS on %s\n", addr)
+		srv := &http.Server{Addr: addr, Handler: handler, TLSConfig: &tls.Config{Certificates: []tls.Certificate{*cert}}}
+		return srv.ListenAndServeTLS("", "") // the certificate is already loaded
+	}
+	fmt.Printf("serving HTTP on %s\n", addr)
+	return http.ListenAndServe(addr, handler)
+}
+
+// autoConfigKey is where a blob carries its self-contained server configuration:
+// the entry `serve -auto` looks for. A fixed, well-known name — the blob's
+// autoexec.bat.
+const autoConfigKey = "/mskblob/auto/site.json"
+
+// loadAutoConfig reads the configuration a blob carries inside. The entry must be
+// there and carry the attributes that make it one: flagged "auto", flagged "nomux"
+// and with no url — a configuration that could be fetched over HTTP is refused
+// rather than served from.
+func loadAutoConfig(b *mskblob.Blob) (serveConfig, error) {
+	var cfg serveConfig
+	if b.GetByKey(autoConfigKey) == nil {
+		return cfg, fmt.Errorf("it carries no configuration of its own (no entry with key %q)", autoConfigKey)
+	}
+	raw, err := readAutoEntry(b, autoConfigKey)
+	if err != nil {
+		return cfg, fmt.Errorf("it cannot be served from its own configuration: %w", err)
+	}
+	if err := json.Unmarshal(raw, &cfg); err != nil {
+		return cfg, fmt.Errorf("invalid JSON in entry %q: %w", autoConfigKey, err)
+	}
+	return cfg, nil
+}
+
+// mountBlobs builds the mux of a serve config: every entry of cfg.Blobs mounted as
+// a sub-mux under its base. A file listed by several entries — typically a
+// container and the blobs nested in it — is opened once and shared. The returned
+// func closes every file opened; on error they are already closed.
+//
+// self is the blob the configuration was read out of (serve -auto), nil when it
+// came from a file: an entry with an empty "file" mounts self, and the caller, who
+// opened it, closes it. selfName is what to call it in a message.
+func mountBlobs(cfg serveConfig, self *mskblob.Blob, selfName string) (*http.ServeMux, func(), error) {
+	roots := map[string]*mskblob.Blob{}
+	closeAll := func() {
+		for _, r := range roots {
+			r.Close()
+		}
+	}
 	mux := http.NewServeMux()
 	for _, bm := range cfg.Blobs {
 		base := bm.Base
 		if base == "" {
 			base = "/"
 		}
-		b, err := mskblob.Load(bm.File, bm.ID)
+		name := mountName(bm, selfName)
+		b, err := openMount(roots, bm, self)
 		if err != nil {
-			return fmt.Errorf("serve: loading blob %q (mounted at %s): %w", bm.File, base, err)
+			closeAll()
+			return nil, nil, fmt.Errorf("serve: loading blob %s (mounted at %s): %w", name, base, err)
 		}
 		// Parse the blob's template entries once, render them with merged vars.
 		tmpls, err := parseBlobTemplates(b)
 		if err != nil {
-			return fmt.Errorf("serve: blob %q: %w", bm.File, err)
+			closeAll()
+			return nil, nil, fmt.Errorf("serve: blob %s: %w", name, err)
 		}
 		vars := mergeVars(cfg.Vars, bm.Vars)
 		mw := func(w http.ResponseWriter, r *http.Request, it *mskblob.Item) int {
@@ -796,21 +943,143 @@ func cmdServe(args []string) error {
 			}
 			return mskblob.DispatchAuto // static → streamed by the blob
 		}
-		mux.Handle(base, withHeaders(b.Handler(base, mw), bm.Headers))
-		fmt.Printf("mounted %s (%d entries, %d templates) at %s\n", bm.File, b.Header().Count, len(tmpls), base)
+		mux.Handle(base, withHeaders(withFallbacks(b.Handler(base, mw), b, base, bm), bm.Headers))
+		fmt.Printf("mounted %s (%d entries, %d templates) at %s\n", name, b.Header().Count, len(tmpls), base)
 	}
+	return mux, closeAll, nil
+}
 
-	addr := cfg.Addr
-	if addr == "" {
-		addr = ":8080"
+// withFallbacks wraps a mount's handler with what the mount declares to try when
+// the requested URL is not an entry (remove_extensions, default_document). The
+// request goes on to h with its path rewritten to the entry found, so that entry
+// is then served — or rendered, if it is a template — exactly as if it had been
+// asked for by name. A mount that declares neither gets h back untouched.
+func withFallbacks(h http.Handler, b *mskblob.Blob, base string, bm blobMount) http.Handler {
+	exts := make([]string, 0, len(bm.RemoveExtensions))
+	for _, e := range bm.RemoveExtensions {
+		if e = strings.TrimSpace(e); e == "" || e == "." {
+			continue
+		}
+		if !strings.HasPrefix(e, ".") {
+			e = "." + e
+		}
+		exts = append(exts, e)
 	}
-	handler := withHeaders(mux, cfg.Headers)
-	if cfg.TLS != nil && cfg.TLS.Cert != "" {
-		fmt.Printf("serving HTTPS on %s\n", addr)
-		return http.ListenAndServeTLS(addr, cfg.TLS.Cert, cfg.TLS.Key, handler)
+	docs := make([]string, 0, len(bm.DefaultDocument))
+	for _, d := range bm.DefaultDocument {
+		if d = strings.TrimSpace(d); d != "" {
+			docs = append(docs, d)
+		}
 	}
-	fmt.Printf("serving HTTP on %s\n", addr)
-	return http.ListenAndServe(addr, handler)
+	if len(exts) == 0 && len(docs) == 0 {
+		return h
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if rel, ok := strings.CutPrefix(r.URL.Path, base); ok {
+			if found := resolveURL(b, rel, exts, docs); found != rel {
+				r2 := *r
+				u := *r.URL
+				u.Path, u.RawPath = base+found, ""
+				r2.URL = &u
+				r = &r2
+			}
+		}
+		h.ServeHTTP(w, r)
+	})
+}
+
+// resolveURL maps a requested URL (relative to the mount's base) to the URL of the
+// entry that answers it. An entry by that exact URL always wins. Only when there
+// is none are the declared alternatives tried, in this order, the first hit
+// winning:
+//
+//  1. exts, when rel ends in "/" or its last segment has no extension: rel without
+//     the trailing slash plus each extension — "about" and "about/" find
+//     "about.html".
+//  2. docs, when rel is empty or ends in "/": rel plus each name — "" finds
+//     "index.html", "docs/" finds "docs/index.html".
+//
+// Nothing else is guessed: "docs" without its slash is not the folder, and what is
+// not declared does not exist. An entry flagged nomux never counts — the handler
+// would not route it. With no hit rel comes back unchanged, to be a 404.
+func resolveURL(b *mskblob.Blob, rel string, exts, docs []string) string {
+	routable := func(u string) bool {
+		it := b.GetByURL(u)
+		return it != nil && it.RestType&mskblob.Nomux == 0
+	}
+	if routable(rel) {
+		return rel
+	}
+	folder := rel == "" || strings.HasSuffix(rel, "/")
+	if stem := strings.TrimSuffix(rel, "/"); stem != "" && (folder || path.Ext(path.Base(stem)) == "") {
+		for _, ext := range exts {
+			if routable(stem + ext) {
+				return stem + ext
+			}
+		}
+	}
+	if folder {
+		for _, doc := range docs {
+			if routable(rel + doc) {
+				return rel + doc
+			}
+		}
+	}
+	return rel
+}
+
+// openMount resolves one config entry to the blob it serves: the file itself (or
+// self, the blob the configuration came out of, when "file" is empty), or —
+// with internal_path — the blob reached by descending through those keys, one
+// nested blob per element. The descent is explicit: nothing is mounted that the
+// config does not name. The id, when set, is checked against the blob finally
+// mounted, not against the file that contains it.
+func openMount(roots map[string]*mskblob.Blob, bm blobMount, self *mskblob.Blob) (*mskblob.Blob, error) {
+	b := self
+	if bm.File != "" {
+		rootKey := bm.File
+		if abs, err := filepath.Abs(bm.File); err == nil {
+			rootKey = abs
+		}
+		if b = roots[rootKey]; b == nil {
+			var err error
+			if b, err = mskblob.Open(bm.File); err != nil {
+				return nil, err
+			}
+			roots[rootKey] = b
+		}
+	} else if self == nil {
+		return nil, fmt.Errorf(`"file" is empty: only a configuration carried inside a blob (serve -auto) may omit it, meaning that same blob`)
+	}
+	for i, key := range bm.InternalPath {
+		child, err := b.OpenBlob(key)
+		if err != nil {
+			return nil, fmt.Errorf("internal_path[%d]: %w", i, err)
+		}
+		b = child
+	}
+	if bm.ID != "" && b.Header().ID != bm.ID {
+		return nil, fmt.Errorf("id mismatch (found %s, expected %s)", b.Header().ID, bm.ID)
+	}
+	return b, nil
+}
+
+// mountName is what to call a config entry in a message: its file, plus the keys
+// descended through when it mounts a nested blob. An empty file is the blob the
+// configuration came out of, selfName.
+func mountName(bm blobMount, selfName string) string {
+	file := bm.File
+	if file == "" {
+		file = selfName
+	}
+	if len(bm.InternalPath) == 0 {
+		return fmt.Sprintf("%q", file)
+	}
+	keys := make([]string, len(bm.InternalPath))
+	for i, k := range bm.InternalPath {
+		keys[i] = fmt.Sprintf("%q", k)
+	}
+	return fmt.Sprintf("%q > %s", file, strings.Join(keys, " > "))
 }
 
 // parseBlobTemplates parses every template/parse entry of the blob (keyed by its
@@ -818,7 +1087,8 @@ func cmdServe(args []string) error {
 func parseBlobTemplates(b *mskblob.Blob) (map[string]*template.Template, error) {
 	out := map[string]*template.Template{}
 	for _, it := range b.Items() {
-		if it.URL == "" || it.RestType&(mskblob.HTMLTemplate|mskblob.Parse) == 0 {
+		// nomux: the handler never routes it, so there is nothing to render it for.
+		if it.URL == "" || it.RestType&mskblob.Nomux != 0 || it.RestType&(mskblob.HTMLTemplate|mskblob.Parse) == 0 {
 			continue
 		}
 		data, err := b.Bytes(&it)
@@ -918,7 +1188,7 @@ Commands:
   manifest -dir <dir>                    [-o f] [-base d] [-include g] [-exclude g] [-recurse] [-nocase]
   create   -manifest <f> -out <blob>     [-id guid] [-base d] [-nocase] [-skip-unchanged]
   dump     -blob <file> -baseout <dir>   [-manifest f]   (or: -file <key> -out f|-stdout)
-  serve    -config <file>
+  serve    -config <file> | -auto <blob>
   version                                Print the version (embed + build info)
   %s
 

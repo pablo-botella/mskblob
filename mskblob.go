@@ -55,6 +55,7 @@ import (
 	"crypto/rand"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"hash/crc32"
 	"io"
@@ -65,6 +66,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync/atomic"
 )
 
 const (
@@ -84,6 +86,10 @@ const flagNoCase byte = 0x01
 // RestType is a bitmask of resource-type flags (mirroring miniskin item type=
 // flags), JSON-encoded as a fixed-width hex string ("0x00000005" = Static|Parse,
 // "" when none).
+//
+// The low byte (0x00FF) belongs to miniskin: those flags mirror its item types.
+// The second byte (0xFF00) is for flags of mskblob's own, so the two sets can grow
+// without ever colliding.
 type RestType int32
 
 const (
@@ -92,7 +98,22 @@ const (
 	Parse        RestType = 0x0004
 	Response     RestType = 0x0008
 	Nomux        RestType = 0x0010
+	// Mskblob is mskblob's own flag, not one of miniskin's — hence the second byte,
+	// which is reserved for them. The entry's bytes are themselves a blob, mounted
+	// with [Blob.OpenBlob] instead of served. Such an
+	// entry is key-only (see [Write]), so it never reaches the routing index — an
+	// older reader that knows nothing of nesting simply cannot hand it out.
+	Mskblob RestType = 0x0100
+	// MskBlobAuto is mskblob's own flag too: the entry is the blob's self-contained
+	// server configuration, the one a blob carries to be served on its own.
+	MskBlobAuto RestType = 0x0200
 )
+
+// ownFlags is the second byte of a [RestType]: the flags that are mskblob's own.
+// Whatever carries one is never served over HTTP, so it must carry [Nomux] too —
+// [Write] refuses to pack it otherwise, and a blob holding such an entry does not
+// open.
+const ownFlags RestType = 0xFF00
 
 // String formats the flags as a fixed-width hex string, e.g. "0x00000005", or
 // "" when no flags are set.
@@ -113,6 +134,8 @@ var restypeNames = []struct {
 	{Parse, "parse"},
 	{Response, "rsp"},
 	{Nomux, "nomux"},
+	{Mskblob, "mskblob"},
+	{MskBlobAuto, "auto"},
 }
 
 // Names returns the comma-separated human flag names, e.g. "static,parse", or ""
@@ -156,6 +179,10 @@ func parseRestType(raw []byte) (RestType, error) {
 			r |= Response
 		case "nomux":
 			r |= Nomux
+		case "mskblob":
+			r |= Mskblob
+		case "auto":
+			r |= MskBlobAuto
 		default:
 			return 0, fmt.Errorf("mskblob: unknown restype flag %q", name)
 		}
@@ -487,6 +514,22 @@ func Write(path string, items []Item, opts Options) (string, error) {
 		if in.URL == "" && in.Key == "" {
 			return "", fmt.Errorf("mskblob: item %d has neither url nor key", i)
 		}
+		// An entry carrying one of mskblob's own flags is never served: a nested blob
+		// is mounted, the self-contained configuration is read. It is reached by key,
+		// so it needs one; it has no URL, which keeps it out of the routing index
+		// altogether; and it says so itself by carrying nomux — required, not implied,
+		// so the entry reads the same in a manifest as it behaves.
+		if own := in.RestType & ownFlags; own != 0 {
+			if in.Key == "" {
+				return "", fmt.Errorf("mskblob: item %d is flagged %q and needs a key", i, own.Names())
+			}
+			if in.URL != "" {
+				return "", fmt.Errorf("mskblob: %q is flagged %q and must have no url (it is reached by key, never served)", in.Key, own.Names())
+			}
+			if in.RestType&Nomux == 0 {
+				return "", fmt.Errorf("mskblob: %q is flagged %q and must also be flagged \"nomux\"", in.Key, own.Names())
+			}
+		}
 		if in.URL != "" {
 			if seenURL[fold(in.URL)] {
 				return "", fmt.Errorf("mskblob: duplicate url %q%s", in.URL, caseNote)
@@ -498,6 +541,19 @@ func Write(path string, items []Item, opts Options) (string, error) {
 				return "", fmt.Errorf("mskblob: duplicate key %q%s", in.Key, caseNote)
 			}
 			seenKey[fold(in.Key)] = true
+		}
+	}
+
+	// A file cannot include itself. Creating path truncates it, and the copy would
+	// then read back the very bytes it appends — a loop that only ends when the disk
+	// is full. Compared as files, not as path strings, so a relative path, a link or
+	// a different spelling of the same file is caught too. Checked before anything
+	// is created: the existing file is left untouched.
+	if out, err := os.Stat(path); err == nil {
+		for _, in := range sorted {
+			if si, err := os.Stat(in.Src); err == nil && os.SameFile(out, si) {
+				return "", fmt.Errorf("mskblob: source %s is the output file itself: a blob cannot include itself", in.Src)
+			}
 		}
 	}
 
@@ -681,9 +737,41 @@ func ReadHeader(path string) (Header, error) {
 	return Header{Version: version, ID: id, Count: count, DataCRC32: dataCRC, DataSize: fi.Size() - int64(dataOffset), NoCase: nocase}, nil
 }
 
-// Blob is an opened, indexed blob ready to serve.
-type Blob struct {
+// ErrClosed is returned by a read on a blob whose descriptor is already closed —
+// including a nested one, which reads through the descriptor its root owns.
+var ErrClosed = errors.New("mskblob: blob is closed")
+
+// source is the byte origin shared by a whole blob tree: the descriptor the root
+// opened, plus the flag every read consults. Nested blobs read through it over
+// their own section, so closing the root makes the entire subtree fail with
+// [ErrClosed] instead of reading from a freed — and possibly reused — descriptor.
+type source struct {
 	f      *os.File
+	closed atomic.Bool
+}
+
+func (s *source) ReadAt(p []byte, off int64) (int, error) {
+	if s.closed.Load() {
+		return 0, ErrClosed
+	}
+	return s.f.ReadAt(p, off)
+}
+
+// Close closes the descriptor once; further calls are no-ops.
+func (s *source) Close() error {
+	if s.closed.Swap(true) {
+		return nil
+	}
+	return s.f.Close()
+}
+
+// Blob is an opened, indexed blob ready to serve. It is either a root — opened
+// from a file, which it owns — or one nested inside another, read in place over
+// its own section of the parent.
+type Blob struct {
+	src    *source     // the descriptor, shared by the whole tree
+	r      io.ReaderAt // this blob's own zero: the source, or a section of the parent
+	owns   bool        // true for the root: its Close releases src
 	hdr    Header
 	byURL  map[string]Item // entries with a non-empty URL (served over HTTP)
 	byKey  map[string]Item // entries with a non-empty Key (logical lookup, e.g. templates)
@@ -705,19 +793,31 @@ func Open(path string) (*Blob, error) {
 	if err != nil {
 		return nil, err
 	}
-	id, count, dataCRC, dataOffset, nocase, err := readMeta(f)
-	if err != nil {
-		f.Close()
-		return nil, err
-	}
-	items, err := readIndex(f, count, dataOffset)
-	if err != nil {
-		f.Close()
-		return nil, err
-	}
 	fi, err := f.Stat()
 	if err != nil {
 		f.Close()
+		return nil, err
+	}
+	src := &source{f: f}
+	b, err := newBlob(src, src, fi.Size(), true)
+	if err != nil {
+		f.Close()
+		return nil, err
+	}
+	return b, nil
+}
+
+// newBlob reads a blob's header and index from r — the whole file for a root
+// blob, a section of the parent for a nested one — and builds its lookups. Every
+// offset read is relative to r's own zero, which is what lets a nested blob be
+// parsed in place: it never learns where it sits.
+func newBlob(src *source, r io.ReaderAt, size int64, owns bool) (*Blob, error) {
+	id, count, dataCRC, dataOffset, nocase, err := readMeta(r)
+	if err != nil {
+		return nil, err
+	}
+	items, err := readIndex(r, count, dataOffset)
+	if err != nil {
 		return nil, err
 	}
 	fold := func(s string) string {
@@ -729,6 +829,11 @@ func Open(path string) (*Blob, error) {
 	byURL := make(map[string]Item, len(items))
 	byKey := make(map[string]Item, len(items))
 	for _, it := range items {
+		// Refused rather than ignored: taking the entry for a plain one would let a
+		// handler hand out what was packed never to be served.
+		if own := it.RestType & ownFlags; own != 0 && it.RestType&Nomux == 0 {
+			return nil, fmt.Errorf("mskblob: entry %q is flagged %q without \"nomux\"", entryID(it), own.Names())
+		}
 		if it.URL != "" {
 			byURL[fold(it.URL)] = it
 		}
@@ -737,13 +842,60 @@ func Open(path string) (*Blob, error) {
 		}
 	}
 	return &Blob{
-		f:      f,
-		hdr:    Header{Version: version, ID: id, Count: count, DataCRC32: dataCRC, DataSize: fi.Size() - int64(dataOffset), NoCase: nocase},
+		src:    src,
+		r:      r,
+		owns:   owns,
+		hdr:    Header{Version: version, ID: id, Count: count, DataCRC32: dataCRC, DataSize: size - int64(dataOffset), NoCase: nocase},
 		byURL:  byURL,
 		byKey:  byKey,
 		items:  items,
 		nocase: nocase,
 	}, nil
+}
+
+// entryID names an entry in a message: its key, or its url when it has no key.
+func entryID(it Item) string {
+	if it.Key != "" {
+		return it.Key
+	}
+	return it.URL
+}
+
+// OpenBlob mounts the blob nested under key: an entry marked [Mskblob], whose
+// bytes are themselves a blob. It is read in place, over its own section of this
+// one — nothing is extracted, and the child's offsets stay relative to itself —
+// so what comes back is an ordinary *Blob on which OpenBlob works again: nesting
+// costs one addition per level, resolved when mounting, not when serving.
+//
+// The child reads through the descriptor the root owns: its own [Blob.Close] is a
+// no-op, and closing the root closes the whole subtree with it.
+func (b *Blob) OpenBlob(key string) (*Blob, error) {
+	it := b.GetByKey(key)
+	if it == nil {
+		return nil, fmt.Errorf("mskblob: no entry with key %q", key)
+	}
+	if it.RestType&Mskblob == 0 {
+		return nil, fmt.Errorf("mskblob: entry %q is not a nested blob (restype %q)", key, it.RestType.Names())
+	}
+	child, err := newBlob(b.src, io.NewSectionReader(b.r, int64(it.Offset), int64(it.Size)), int64(it.Size), false)
+	if err != nil {
+		return nil, fmt.Errorf("mskblob: mounting %q: %w", key, err)
+	}
+	return child, nil
+}
+
+// LoadBlob mounts the blob nested under key and, when expectID is non-empty,
+// verifies its guid — the nested counterpart of [Load]. Same purpose one level in:
+// a child rebuilt or swapped inside the container is rejected rather than read.
+func (b *Blob) LoadBlob(key, expectID string) (*Blob, error) {
+	child, err := b.OpenBlob(key)
+	if err != nil {
+		return nil, err
+	}
+	if expectID != "" && child.hdr.ID != expectID {
+		return nil, fmt.Errorf("mskblob: nested blob %q: id mismatch (found %s, expected %s)", key, child.hdr.ID, expectID)
+	}
+	return child, nil
 }
 
 // Load opens a blob and, when expectID is non-empty, verifies its guid matches
@@ -803,7 +955,7 @@ func (b *Blob) GetByKey(key string) *Item {
 // [Blob.Reader], which streams without allocating the whole thing.
 func (b *Blob) Bytes(it *Item) ([]byte, error) {
 	buf := make([]byte, it.Size)
-	if _, err := b.f.ReadAt(buf, int64(it.Offset)); err != nil {
+	if _, err := b.r.ReadAt(buf, int64(it.Offset)); err != nil {
 		return nil, err
 	}
 	return buf, nil
@@ -812,11 +964,19 @@ func (b *Blob) Bytes(it *Item) ([]byte, error) {
 // Reader returns a reader over an entry's bytes, straight from the blob file
 // (nothing resident in RAM). Ideal for streaming big assets with io.Copy.
 func (b *Blob) Reader(it *Item) *io.SectionReader {
-	return io.NewSectionReader(b.f, int64(it.Offset), int64(it.Size))
+	return io.NewSectionReader(b.r, int64(it.Offset), int64(it.Size))
 }
 
-// Close releases the underlying file.
-func (b *Blob) Close() error { return b.f.Close() }
+// Close releases the descriptor the root blob opened, and with it the whole tree:
+// a later read on this blob or on any blob nested inside it returns [ErrClosed]
+// rather than hitting a freed descriptor. On a nested blob it is a no-op — it
+// owns nothing, the lifetime belongs to the root.
+func (b *Blob) Close() error {
+	if !b.owns {
+		return nil
+	}
+	return b.src.Close()
+}
 
 // Dispatch codes a [Middleware] returns to drive [Blob.Handler].
 const (
@@ -837,7 +997,9 @@ type Middleware func(w http.ResponseWriter, r *http.Request, it *Item) int
 // server — no listening, TLS, or config lives here.
 //
 // For each request it looks the base-stripped path up and calls mw (when non-nil)
-// with the matched item (nil if the URL is absent). mw returns:
+// with the matched item (nil if the URL is absent). An entry flagged [Nomux] is
+// not routed at all: it counts as absent, for mw as much as for the default
+// serving — reach it by key instead. mw returns:
 //   - [DispatchAuto] (0): the blob serves it — but the default handler serves
 //     ONLY static entries (streamed lazily, ETag = crc32, If-None-Match → 304).
 //     Anything else (template, response, or an absent URL) is treated as if it
@@ -847,6 +1009,9 @@ type Middleware func(w http.ResponseWriter, r *http.Request, it *Item) int
 func (b *Blob) Handler(base string, mw Middleware) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		it := b.GetByURL(strings.TrimPrefix(r.URL.Path, base))
+		if it != nil && it.RestType&Nomux != 0 {
+			it = nil // nomux: not routed, as if the URL were absent
+		}
 		code := DispatchAuto
 		if mw != nil {
 			code = mw(w, r, it)

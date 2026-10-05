@@ -26,6 +26,9 @@ go install github.com/pablo-botella/mskblob/cmd/mskblob@latest    # CLI
   deployed `.blob` matches the program that expects it.
 - **HTTP-ready** — `Blob.Handler(base)` is a drop-in `http.Handler` with ETag,
   conditional `If-None-Match → 304`, and MIME by extension.
+- **Nestable** — an entry can hold another blob, mounted in place with
+  `Blob.OpenBlob(key)`: a whole tree of independently built, independently
+  verifiable blobs ships as one file.
 - **One JSON manifest shape** for create / inspect / dump — human-readable, with
   hex numbers and no float-precision traps.
 

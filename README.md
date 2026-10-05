@@ -20,6 +20,9 @@ go install github.com/pablo-botella/mskblob/cmd/mskblob@latest    # CLI
   deployed `.blob` matches the program that expects it.
 - **HTTP-ready** — `Blob.Handler(base)` is a drop-in `http.Handler` with ETag,
   conditional `If-None-Match → 304`, and MIME by extension.
+- **Nestable** — an entry can hold another blob, mounted in place with
+  `Blob.OpenBlob(key)`: a whole tree of independently built, independently
+  verifiable blobs ships as one file.
 - **One JSON manifest shape** for create / inspect / dump — human-readable, with
   hex numbers and no float-precision traps.
 
@@ -54,6 +57,7 @@ another blob**, fully standalone: nothing here depends on miniskin.
 | **GUID** | A random RFC-4122 v4 id stamped in the header. The sync token: a loader can demand the blob's id match what it was built against. |
 | **Base** | The URL prefix a blob is mounted under. Entry URLs are stored **relative** to it; `Handler(base)` strips the base before lookup. |
 | **Sealed index** | Lookups go through the in-memory index only. A path that isn't a packed entry is a 404 — there is no filesystem access and no traversal. |
+| **Nested blob** | An entry whose bytes are themselves a blob (`restype: mskblob,nomux`, key-only). `OpenBlob` mounts it in place over its section of the parent — same format, one level in — so a whole tree of blobs ships as a single file. |
 
 A blob is **not updatable in place**. To change one: `dump` it to a directory
 (`-manifest` to get the manifest too), edit, then `create` a fresh blob. It was
@@ -100,7 +104,8 @@ The blob is a **sub-mux**: you register only the base on your own mux and
 (`nil` middleware) serves **only static** entries — streamed **lazily** from the
 file (nothing resident in RAM, vital for a 245 MB image set), with `ETag` = crc32
 (`If-None-Match` → `304`) and a `Content-Type` by extension. Anything else (a
-template, or an unknown URL) is treated as if it weren't there → `404`.
+template, or an unknown URL) is treated as if it weren't there → `404`. An entry
+flagged `nomux` is never routed at all — reach it by key.
 
 To do more, pass a **middleware** — one hook called for every request with the
 matched item (`nil` when the URL is absent, so it can answer unknown routes too).
@@ -166,6 +171,43 @@ type Header struct {
 (magic, version, count, data crc, and the GUID) without touching the index or
 data — enough to confirm a deployed file matches the program via its GUID.
 
+### Nested blobs
+
+A blob's bytes are opaque, so an entry can hold another blob. Mark it
+`Mskblob | Nomux` and give it a **key and no URL** — `Write` enforces all three —
+and it is mounted instead of served:
+
+```go
+func (b *Blob) OpenBlob(key string) (*Blob, error)            // mount the nested blob
+func (b *Blob) LoadBlob(key, expectID string) (*Blob, error)  // OpenBlob + verify the GUID
+
+var ErrClosed = errors.New("mskblob: blob is closed")
+```
+
+What comes back is an ordinary `*Blob`, read **in place** over its own section of
+the parent — nothing is extracted — so `OpenBlob` works on it again, at any depth.
+Each level keeps its own GUID, index and case rule, and its offsets stay relative
+to itself: composing levels is one addition each, resolved when mounting and not
+on every read.
+
+The whole tree reads through the descriptor the root opened. A nested blob's
+`Close` is therefore a no-op — it owns nothing — while closing the root closes the
+subtree with it: a later read returns `ErrClosed` instead of reaching a freed
+descriptor.
+
+Composing one is the usual build, bottom up — write each inner blob as a file,
+then pack it like any other source:
+
+```go
+mskblob.Write("dist/site.blob", []mskblob.Item{
+    {Key: "/img", Filename: "img.blob", RestType: mskblob.Mskblob | mskblob.Nomux, Src: "dist/img.blob"},
+}, mskblob.Options{})
+```
+
+A blob cannot include itself: `Write` rejects any item, nested or not, whose `Src`
+is the output file. The two are compared as files rather than as path strings, and
+the check runs before anything is created, so the existing file is left untouched.
+
 ### Listing & access
 
 The package's job is to **list** what's inside and hand you the bytes — it finds
@@ -205,7 +247,8 @@ func MimeByExt(name string) string   // extension → Content-Type
 
 `Handler` is the sub-mux described above: a `nil` middleware serves only static
 entries; a middleware sees every request (item `nil` if absent) and its return
-drives dispatch. It is the **only** part touching `net/http`; everything else is
+drives dispatch. An entry flagged `Nomux` is **not routed**: for the handler and for
+the middleware alike it counts as absent, and stays reachable by key. It is the **only** part touching `net/http`; everything else is
 router-agnostic, so you can also ignore `Handler` and build serving yourself from
 `GetByURL`/`Reader`.
 
@@ -230,6 +273,9 @@ const (
     Parse        RestType = 0x0004
     Response     RestType = 0x0008
     Nomux        RestType = 0x0010
+    // low byte: miniskin's flags; second byte: mskblob's own
+    Mskblob      RestType = 0x0100 // the entry's bytes are themselves a blob
+    MskBlobAuto  RestType = 0x0200 // the entry is the blob's self-contained server configuration
 )
 
 func (r RestType) Names() string  // "static,parse"  (the JSON form)
@@ -238,7 +284,8 @@ func (r RestType) String() string // "0x00000005"    (hex form)
 
 `RestType` mirrors miniskin's item `type=` flags so a blob built by miniskin
 preserves how each resource should be wired. For standalone use you typically only
-need `Static`.
+need `Static`. `Mskblob` is the one flag that isn't miniskin's: it marks a
+[nested blob](#nested-blobs), mounted with `OpenBlob` rather than served.
 
 ---
 
@@ -251,7 +298,7 @@ mskblob manifest -dir <dir>                    [-o f] [-base d] [-include g] [-e
 mskblob create   -manifest <f> -out <blob>     [-id guid] [-base d] [-nocase] [-skip-unchanged]
 mskblob dump     -blob <file> -baseout <dir>   [-manifest f]
 mskblob dump     -blob <file> -file <key>      (-baseout d | -out f | -stdout)
-mskblob serve    -config <file>
+mskblob serve    -config <file> | -auto <blob>
 mskblob generate-claude-skill                  [-dst f] [-global] [-force]
 mskblob generate-agent-docs                    [-dst f] [-force]
 ```
@@ -357,6 +404,16 @@ mskblob create -manifest prod-img.json -out prod-img.blob -base ./assets
   and the build runs. Useful when a project rebuilds many blobs repeatedly; to force
   a rebuild, delete the `.blob` or change the id.
 
+A **nested blob** takes no special flag — it is an item like any other, with a `key`,
+no `url` and a built `.blob` as its source. Levels are built bottom up, one `create`
+per level:
+
+```sh
+mskblob create -manifest img.json  -out img.blob    # the inner blob
+# site.json: [{"key": "/img", "filename": "img.blob", "restype": "mskblob,nomux", "src": "img.blob"}]
+mskblob create -manifest site.json -out site.blob   # the container
+```
+
 ### `dump` — extract a blob's files
 
 ```sh
@@ -366,10 +423,12 @@ mskblob create -manifest ./out/manifest.json -out img2.blob          # round-tri
 ```
 
 `dump` is for **extracting the asset files**: it writes every entry under `-baseout`
-(its base directory). It does **not** write a manifest by default — `-manifest <file>`
-is an extra that also emits the manifest in one command, with each `src` pointing at
-the just-written files, so `create -manifest <file>` recreates the blob. Entry paths
-are validated — an entry that would escape the base dir (`..`, absolute) is rejected.
+(its base directory), each at its url — or at its **key** when it has no url, as a
+template or a nested blob does. It does **not** write a manifest by default —
+`-manifest <file>` is an extra that also emits the manifest in one command, with each
+`src` pointing at the just-written files, so `create -manifest <file>` recreates the
+blob. Entry paths are validated — an entry that would escape the base dir (`..`,
+absolute) or has no name at all is rejected.
 
 **One entry at a time.** `dump -file <key>` extracts just the entry with that **key**
 to exactly one destination:
@@ -417,6 +476,124 @@ mskblob serve -config server.json
 `addr` defaults to `:8080` and `base` to `/`. This is also the reference for how
 `Blob.Handler` is wired with a middleware — your own app does the same shape.
 
+**Serving a blob nested in another.** A [nested blob](#nested-blobs) is never served
+through its parent: it has no url, and `serve` mounts nothing by itself. Name it —
+`internal_path` lists the **keys to descend through**, outermost first, one nested
+blob per element:
+
+```json
+{
+  "blobs": [
+    { "file": "site.blob", "base": "/" },
+    { "file": "site.blob", "base": "/docs/",    "internal_path": ["/docs"] },
+    { "file": "site.blob", "base": "/docs/es/", "internal_path": ["/docs", "/es"], "id": "947d…" }
+  ]
+}
+```
+
+It is an array rather than one slash-separated string because a key may contain
+slashes of its own. Absent or empty, the entry mounts the file itself, as before. The
+mounted blob is read in place, straight from its section of the file — nothing is
+extracted — and a file listed by several entries is opened once. `id` checks the
+blob **finally mounted**, not the file that contains it. A key that does not exist,
+or is not a nested blob, stops the server from starting.
+
+**What a URL that is not an entry may still find.** By default a mount serves exact
+matches only: `/` and `/docs/` are a 404, because no entry has that url. Two options,
+**per mount** and off unless declared, say what else to try — the lists are tried in
+order and the first hit wins:
+
+```json
+{ "file": "site.blob", "base": "/",
+  "remove_extensions": [".html"],
+  "default_document": ["index.html"] }
+```
+
+| Option | Applies when the URL… | Tries | Example |
+|---|---|---|---|
+| `remove_extensions` | has no extension, or ends in `/` | the URL (minus its slash) + each extension | `/about` → `about.html` |
+| `default_document` | is the root, or ends in `/` | the URL + each name | `/docs/` → `docs/index.html` |
+
+An entry by the exact URL always wins, and is served as it is — there are **no
+redirects**: `/about.html` keeps working next to `/about`. When both options apply
+the extensions go first (`/docs/` finds `docs.html` before `docs/index.html`). Nothing
+else is guessed: `/docs` without its slash is not the folder and stays a 404 — what
+is not declared does not exist. A `nomux` entry is never found this way, and a
+template found this way is rendered like any other.
+
+**HTTPS and an encrypted key.** `tls.cert` and `tls.key` are PEM files. The key may
+be **encrypted** — PKCS#8 with PBKDF2 and AES or triple-DES, what `openssl` writes by default
+(`BEGIN ENCRYPTED PRIVATE KEY`). Its password is never in the config, only where to
+find it:
+
+```json
+"tls": { "cert": "cert.pem", "key": "key.pem",
+         "password_file": "/run/secrets/tls_password",
+         "password_env": "MSKBLOB_TLS_PASSWORD" }
+```
+
+`password_file` is a file holding the password (a trailing newline is dropped) — a
+mounted Docker/Kubernetes secret fits; `password_env` names an environment variable.
+With both, the file wins, and the variable is used when the file is not there. An
+unencrypted key needs neither. A key derived with scrypt, a legacy `DEK-Info` PEM or
+a PFX is refused with a message saying so.
+
+**Self-contained: the blob carries its own config.** With `-config` the config is the
+entry point and names the blobs to open. `-auto` turns it round — the blob is the
+entry point and brings the config that serves it, like a disk with its `autoexec.bat`:
+
+```sh
+mskblob serve -auto site.blob
+```
+
+The config is an ordinary entry of the blob at the fixed key
+**`/mskblob/auto/site.json`**, flagged `auto,nomux` and with no url, so it is never
+served itself:
+
+```json
+{ "key": "/mskblob/auto/site.json", "restype": "auto,nomux", "src": "site.json" }
+```
+
+Its content is the same JSON as above, with one difference: `file` may be left out,
+meaning **this same blob** — the config cannot know what the file will be called once
+deployed. `internal_path` then descends from it, and a `file` with a value is still an
+external file:
+
+```json
+{
+  "blobs": [
+    { "base": "/" },
+    { "base": "/docs/", "internal_path": ["/docs"] }
+  ]
+}
+```
+
+If the entry is missing, lacks `auto` or `nomux`, has a url, or is not valid JSON, the
+server does not start. `-auto` and `-config` cannot be combined — nothing is merged:
+to serve the blob another way, pass a config file and the one inside is not looked at.
+The config of a nested blob is ignored when its parent is served.
+
+With `-auto` the certificate travels in the blob too. `tls.cert` and `tls.key` are
+then not paths but **keys of entries of the blob itself**, which must live under
+`/mskblob/` and be flagged `auto,nomux` — without those attributes they cannot be
+used, and the server does not start:
+
+```json
+{ "key": "/mskblob/auto/cert.pem", "restype": "auto,nomux", "src": "cert.pem" },
+{ "key": "/mskblob/auto/key.pem",  "restype": "auto,nomux", "src": "key.pem" }
+```
+
+```json
+"tls": { "cert": "/mskblob/auto/cert.pem", "key": "/mskblob/auto/key.pem",
+         "password_env": "MSKBLOB_TLS_PASSWORD" }
+```
+
+Being `nomux` and url-less they are never served. But the blob now **contains the
+private key**, and `dump` extracts it like any entry: encrypt the key, so that the
+file alone is not enough, and keep its password outside — in the environment or in a
+file. To use a certificate on disk instead (say, one renewed without rebuilding the
+blob), serve with `-config`.
+
 ---
 
 ## Manifest format
@@ -448,15 +625,39 @@ One JSON shape is used everywhere — `create` reads it; `manifest`, `dump` and
 
 | Field | Required | Meaning |
 |-------|----------|---------|
-| `url` | yes | lookup key, relative to the mount base |
+| `url` | one of `url`/`key` | lookup key, relative to the mount base |
 | `src` | yes (build) | file to read the bytes from |
-| `key` | no | optional logical key |
+| `key` | one of `url`/`key` | logical key — how a template or a nested blob is reached |
 | `filename` | no | recorded source name (defaults to `url`) |
 | `restype` | no | type-flag mask (defaults to `static`) |
 
 **`restype`** is a human flag mask: comma-separated names
-`static,tpl,parse,rsp,nomux` (empty = none). On input a hex or decimal value
+`static,tpl,parse,rsp,nomux,mskblob,auto` (empty = none). On input a hex or decimal value
 (`"0x05"`, `5`) is also accepted, but the canonical output is names.
+
+**A nested blob** is declared like any other entry — `restype: "mskblob,nomux"`, a
+`key`, no `url` (it is mounted, never served), and `src` pointing at the already-built
+`.blob`:
+
+```json
+{ "key": "/img", "filename": "img.blob", "restype": "mskblob,nomux", "src": "dist/img.blob" }
+```
+
+**`mskblob` and `auto` are mskblob's own flags**, and whatever carries one is never
+served: the entry must have a `key`, no `url`, and `nomux` as well. `create` refuses
+to build the blob otherwise. The blob's **self-contained server configuration** (see
+`serve -auto`) is one such entry, at a fixed key:
+
+```json
+{ "key": "/mskblob/auto/site.json", "restype": "auto,nomux", "src": "site.json" }
+```
+
+The folder `/mskblob/` is where the server reads what it needs from the blob itself:
+that configuration and, for HTTPS, the certificate and its key. Each such entry must
+be under `/mskblob/` **and** flagged `auto,nomux`, or the server will not use it.
+
+Each level has its own manifest: build the inner blobs first, then reference them
+from the one above.
 
 **Computed fields** — `crc32`, `sizeLow`/`sizeHigh`, `offsetLow`/`offsetHigh`
 (plus the manifest-level `version`, `count`, `dataCRC32`). They are emitted for
@@ -504,6 +705,12 @@ Index entries are 16-byte aligned the way Windows resources are — it keeps the
 index scannable and leaves room without disturbing offsets. Because every entry
 carries its full identity, the blob is self-describing: it can be served on its
 own, and its header alone is enough to verify a deployed file (via the GUID).
+
+Every position it records is relative to the blob's own start — `dataOffset` to
+byte 0 of the file, each entry's offset to `dataOffset`. Nothing absolute is ever
+baked in, which is why a blob stays valid wherever it lands: nesting one inside
+another copies it byte for byte, and mounting it is a single addition, with no
+relocation to patch.
 
 ---
 

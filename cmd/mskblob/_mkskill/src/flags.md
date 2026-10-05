@@ -66,7 +66,10 @@ mkskill:
 
 | Flag | Default | Description |
 |---|---|---|
-| `-config` | | JSON server config (required) |
+| `-config` | | JSON server config: the config names the blobs to open |
+| `-auto` | | Blob to serve from the config **it carries inside** |
+
+> Exactly one of the two: `-config` and `-auto` cannot be combined, and nothing is merged.
 
 `generate-claude-skill`:
 

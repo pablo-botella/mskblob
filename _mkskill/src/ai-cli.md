@@ -13,7 +13,7 @@ mskblob manifest -dir <dir>                    [-o f] [-base d] [-include g] [-e
 mskblob create   -manifest <f> -out <blob>     [-id guid] [-base d] [-nocase] [-skip-unchanged]
 mskblob dump     -blob <file> -baseout <dir>   [-manifest f]
 mskblob dump     -blob <file> -file <key>      (-baseout d | -out f | -stdout)
-mskblob serve    -config <file>
+mskblob serve    -config <file> | -auto <blob>
 ```
 
 `go install github.com/pablo-botella/mskblob/cmd/mskblob@latest`
@@ -51,10 +51,15 @@ mskblob serve    -config <file>
   (`-id` or the manifest's); with an auto id every build mints a fresh guid, so there
   is nothing to compare and the build runs (with a warning). Handy in projects that
   rebuild many blobs repeatedly; to force a rebuild, delete the `.blob` or change the id.
+  A **nested blob** needs no special flag: give the item `restype: "mskblob,nomux"`, a
+  `key`, no `url`, and a built `.blob` as `src`. Levels are built bottom up, one `create`
+  each.
 - `dump` is for **extracting the asset files**: it writes every entry under `-baseout`
-  (its directory). It does **not** write a manifest by default; `-manifest <file>` is
-  an extra that also emits the manifest in one go, with each `src` pointing at the
-  just-extracted files so `create -manifest <file>` round-trips the blob.
+  (its directory), each at its url — or at its **key** when it has none, as a template
+  or a nested blob does. It does **not** write a manifest by default; `-manifest <file>`
+  is an extra that also emits the manifest in one go, with each `src` pointing at the
+  just-extracted files so `create -manifest <file>` round-trips the blob, nested blobs
+  included. An entry that would escape the base dir, or has no name at all, is rejected.
 - `dump -file <key>` extracts **just one entry** (looked up by **key**) to exactly one
   destination: `-baseout <dir>` (lands at the entry's subpath, e.g. key
   `/patata/frita.png` → `<dir>/patata/frita.png`), `-out <file>` (an explicit path,
@@ -88,8 +93,47 @@ Mounts each blob as a sub-mux under its `base`; statics stream lazily and
 **template** entries are rendered (`html/template`) with the merged variables.
 `vars` and `headers` exist at **two levels — global and per-blob** — and merge, the
 blob's winning. Serves HTTPS when `tls.cert`/`tls.key` are set, else plain HTTP
-(fine behind a Cloudflare-style tunnel that terminates TLS). All fields except
-`blobs[].file`/`base` are optional (`addr` defaults `:8080`, `base` defaults `/`).
+(fine behind a Cloudflare-style tunnel that terminates TLS). Only `blobs[].file`
+is required — and not even that with `-auto` (`addr` defaults `:8080`, `base` defaults `/`).
+
+**Nested blobs are served only when named.** `serve` never descends by itself, and a
+nested blob has no url, so its parent 404s for it. Add `"internal_path": ["/docs", "/es"]`
+to an entry — an **array of keys** to descend through, outermost first, one nested
+blob per element (an array, not a slash-separated string: keys may contain slashes).
+Absent/empty = the file itself. The same `file` may appear in several entries (the
+container at `/`, a child at `/docs/`…); it is opened once and each nested blob is
+read in place. `id` then verifies the blob finally mounted. An unknown key, or one
+that is not a `mskblob` entry, is a startup error naming `internal_path[n]`.
+
+**`serve -auto <blob>` — the blob carries its own config.** `-config`: the config
+loads the blobs. `-auto`: the blob loads the config, from its entry with the fixed key
+**`/mskblob/auto/site.json`**, which must be flagged `auto,nomux` and have no url
+(manifest: `{"key": "/mskblob/auto/site.json", "restype": "auto,nomux", "src": "site.json"}`).
+Same JSON as `-config`, except `blobs[].file` may be omitted = **this same blob**
+(`internal_path` descends from it; a `file` with a value is an external file). Entry
+missing / wrongly flagged / with a url / invalid JSON → startup error. `-auto` and
+`-config` are mutually exclusive: nothing is merged. A nested blob's own config is
+ignored when its parent is served.
+
+**A URL that is not an entry is a 404 unless the mount declares otherwise.** Two
+per-mount options, off by default, each a list tried in order (first hit wins):
+`"remove_extensions": [".html"]` — a URL with no extension or ending in `/` also
+tries itself (minus the slash) + each extension (`/about` → `about.html`);
+`"default_document": ["index.html"]` — the root or a URL ending in `/` also tries
+itself + each name (`/docs/` → `docs/index.html`). Exact matches always win and are
+served as they are: **no redirects**. Extensions are tried before documents. `/docs`
+without its slash is **not** the folder (404): nothing undeclared exists. `nomux`
+entries are never found this way; templates found this way are rendered.
+
+**TLS.** `tls.cert`/`tls.key`: with `-config`, PEM **paths on disk**; with `-auto`,
+**keys of entries of the blob itself**, which must be under `/mskblob/` and flagged
+`auto,nomux` (else startup error) — e.g. `/mskblob/auto/cert.pem`, `/mskblob/auto/key.pem`.
+The key may be an **encrypted PKCS#8** (PBES2: PBKDF2 + AES-CBC or 3DES-CBC, what openssl writes);
+the password comes from `tls.password_file` (file content, trailing newline dropped)
+or the env var named by `tls.password_env` — file wins, env is the fallback when the
+file is absent; never from the config. Unencrypted keys need neither. scrypt, legacy
+`DEK-Info` PEM and PFX are refused by name. A blob carrying its key contains a
+secret (`dump` extracts it): encrypt the key and keep the password outside.
 
 ### Generating these docs
 

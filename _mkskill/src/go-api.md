@@ -39,6 +39,43 @@ type Header struct {
 (magic, version, count, data crc, and the GUID) without touching the index or
 data — enough to confirm a deployed file matches the program via its GUID.
 
+### Nested blobs
+
+A blob's bytes are opaque, so an entry can hold another blob. Mark it
+`Mskblob | Nomux` and give it a **key and no URL** — `Write` enforces all three —
+and it is mounted instead of served:
+
+```go
+func (b *Blob) OpenBlob(key string) (*Blob, error)            // mount the nested blob
+func (b *Blob) LoadBlob(key, expectID string) (*Blob, error)  // OpenBlob + verify the GUID
+
+var ErrClosed = errors.New("mskblob: blob is closed")
+```
+
+What comes back is an ordinary `*Blob`, read **in place** over its own section of
+the parent — nothing is extracted — so `OpenBlob` works on it again, at any depth.
+Each level keeps its own GUID, index and case rule, and its offsets stay relative
+to itself: composing levels is one addition each, resolved when mounting and not
+on every read.
+
+The whole tree reads through the descriptor the root opened. A nested blob's
+`Close` is therefore a no-op — it owns nothing — while closing the root closes the
+subtree with it: a later read returns `ErrClosed` instead of reaching a freed
+descriptor.
+
+Composing one is the usual build, bottom up — write each inner blob as a file,
+then pack it like any other source:
+
+```go
+mskblob.Write("dist/site.blob", []mskblob.Item{
+    {Key: "/img", Filename: "img.blob", RestType: mskblob.Mskblob | mskblob.Nomux, Src: "dist/img.blob"},
+}, mskblob.Options{})
+```
+
+A blob cannot include itself: `Write` rejects any item, nested or not, whose `Src`
+is the output file. The two are compared as files rather than as path strings, and
+the check runs before anything is created, so the existing file is left untouched.
+
 ### Listing & access
 
 The package's job is to **list** what's inside and hand you the bytes — it finds
@@ -78,7 +115,8 @@ func MimeByExt(name string) string   // extension → Content-Type
 
 `Handler` is the sub-mux described above: a `nil` middleware serves only static
 entries; a middleware sees every request (item `nil` if absent) and its return
-drives dispatch. It is the **only** part touching `net/http`; everything else is
+drives dispatch. An entry flagged `Nomux` is **not routed**: for the handler and for
+the middleware alike it counts as absent, and stays reachable by key. It is the **only** part touching `net/http`; everything else is
 router-agnostic, so you can also ignore `Handler` and build serving yourself from
 `GetByURL`/`Reader`.
 
@@ -103,6 +141,9 @@ const (
     Parse        RestType = 0x0004
     Response     RestType = 0x0008
     Nomux        RestType = 0x0010
+    // low byte: miniskin's flags; second byte: mskblob's own
+    Mskblob      RestType = 0x0100 // the entry's bytes are themselves a blob
+    MskBlobAuto  RestType = 0x0200 // the entry is the blob's self-contained server configuration
 )
 
 func (r RestType) Names() string  // "static,parse"  (the JSON form)
@@ -111,7 +152,8 @@ func (r RestType) String() string // "0x00000005"    (hex form)
 
 `RestType` mirrors miniskin's item `type=` flags so a blob built by miniskin
 preserves how each resource should be wired. For standalone use you typically only
-need `Static`.
+need `Static`. `Mskblob` is the one flag that isn't miniskin's: it marks a
+[nested blob](#nested-blobs), mounted with `OpenBlob` rather than served.
 
 ---
 

@@ -42,5 +42,11 @@ index scannable and leaves room without disturbing offsets. Because every entry
 carries its full identity, the blob is self-describing: it can be served on its
 own, and its header alone is enough to verify a deployed file (via the GUID).
 
+Every position it records is relative to the blob's own start — `dataOffset` to
+byte 0 of the file, each entry's offset to `dataOffset`. Nothing absolute is ever
+baked in, which is why a blob stays valid wherever it lands: nesting one inside
+another copies it byte for byte, and mounting it is a single addition, with no
+relocation to patch.
+
 ---
 

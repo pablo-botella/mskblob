@@ -19,7 +19,8 @@ id, err := m.Write("dist/img.blob")       // packs everything, returns the id
 - `Item.URL` — lookup key, **relative** to the mount base (how it's served).
 - `Item.Key` — a logical id (how non-served resources like templates are reached).
 - `Item.Filename` — recorded source name; `Item.Src` — file to read at Write time.
-- `Item.RestType` — type flags (`Static`, `HTMLTemplate`, `Parse`, `Response`, `Nomux`).
+- `Item.RestType` — type flags (`Static`, `HTMLTemplate`, `Parse`, `Response`, `Nomux`,
+  `Mskblob`).
 - `Item.Size/CRC32/Offset` are **computed** by `Write` (ignored on input).
 - Items are written in `(URL, Key)` order, so the data and its CRC are reproducible;
   only the GUID varies unless pinned. The package-level `Write(path, items, opts)` is
@@ -43,6 +44,27 @@ b, err := mskblob.Open(path)              // open + read index
 b, err := mskblob.Load(path, expectID)    // Open + verify GUID when expectID != ""
 h, err := mskblob.ReadHeader(path)        // cheap: 128-byte header only (cache checks)
 ```
+
+### Nested blobs (a blob inside a blob)
+
+An entry whose bytes are themselves a blob: marked `Mskblob`, with a **key and no
+url** (`Write` enforces both), so it never enters the routing index — it is mounted,
+never served.
+
+```go
+child, err := b.OpenBlob("/img")             // mount it in place; an ordinary *Blob
+child, err := b.LoadBlob("/img", expectID)   // same, with the GUID verified
+```
+
+The child is read over its own section of the parent — nothing extracted — and its
+offsets stay relative to itself, so `OpenBlob` works on it again at any depth: one
+addition per level, resolved when mounting, not on every read. Each level keeps its
+own GUID, index and case rule.
+
+The tree shares the descriptor the root opened: a child's `Close` is a no-op (it owns
+nothing) and closing the root closes the subtree — later reads return `ErrClosed`
+rather than hitting a freed descriptor. Composition is the usual build, bottom up:
+write each inner blob as a file, then pack it as the `Src` of an `Mskblob` item.
 
 ### Listing & access (the package finds resources for you)
 
@@ -73,6 +95,8 @@ func (b *Blob) Handler(base string, mw Middleware) http.Handler
 URL. The **default** (`mw == nil`) serves **only static** entries — streamed
 lazily, `ETag` = crc32, `If-None-Match` → 304, `Content-Type` by extension; anything
 else (template, response, or an absent URL) is treated as if it weren't there → 404.
+An entry flagged `Nomux` is **never routed**: the handler takes it for absent — the
+middleware gets `nil` too — so it is reachable only by key.
 
 Pass a `Middleware` to do more. It is called for **every** request with the matched
 item (`nil` when the URL is absent, so it can answer unknown routes), and its return
@@ -96,4 +120,4 @@ mux.Handle("/site/", b.Handler("/site/", func(w http.ResponseWriter, r *http.Req
 (chi, gin, std). It is the **only** part touching `net/http`; the rest is
 router-agnostic, so you can ignore `Handler` and serve from `GetByURL`/`Reader`
 yourself. Type flags: `Static 0x01, HTMLTemplate 0x02, Parse 0x04, Response 0x08,
-Nomux 0x10`. `RestType.Names()` / `.String()` give the name / hex forms.
+Nomux 0x10` (low byte: miniskin's) and `Mskblob 0x0100, MskBlobAuto 0x0200` (second byte: mskblob's own). `RestType.Names()` / `.String()` give the name / hex forms.

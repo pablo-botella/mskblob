@@ -33,15 +33,39 @@ One JSON shape is used everywhere — `create` reads it; `manifest`, `dump` and
 
 | Field | Required | Meaning |
 |-------|----------|---------|
-| `url` | yes | lookup key, relative to the mount base |
+| `url` | one of `url`/`key` | lookup key, relative to the mount base |
 | `src` | yes (build) | file to read the bytes from |
-| `key` | no | optional logical key |
+| `key` | one of `url`/`key` | logical key — how a template or a nested blob is reached |
 | `filename` | no | recorded source name (defaults to `url`) |
 | `restype` | no | type-flag mask (defaults to `static`) |
 
 **`restype`** is a human flag mask: comma-separated names
-`static,tpl,parse,rsp,nomux` (empty = none). On input a hex or decimal value
+`static,tpl,parse,rsp,nomux,mskblob,auto` (empty = none). On input a hex or decimal value
 (`"0x05"`, `5`) is also accepted, but the canonical output is names.
+
+**A nested blob** is declared like any other entry — `restype: "mskblob,nomux"`, a
+`key`, no `url` (it is mounted, never served), and `src` pointing at the already-built
+`.blob`:
+
+```json
+{ "key": "/img", "filename": "img.blob", "restype": "mskblob,nomux", "src": "dist/img.blob" }
+```
+
+**`mskblob` and `auto` are mskblob's own flags**, and whatever carries one is never
+served: the entry must have a `key`, no `url`, and `nomux` as well. `create` refuses
+to build the blob otherwise. The blob's **self-contained server configuration** (see
+`serve -auto`) is one such entry, at a fixed key:
+
+```json
+{ "key": "/mskblob/auto/site.json", "restype": "auto,nomux", "src": "site.json" }
+```
+
+The folder `/mskblob/` is where the server reads what it needs from the blob itself:
+that configuration and, for HTTPS, the certificate and its key. Each such entry must
+be under `/mskblob/` **and** flagged `auto,nomux`, or the server will not use it.
+
+Each level has its own manifest: build the inner blobs first, then reference them
+from the one above.
 
 **Computed fields** — `crc32`, `sizeLow`/`sizeHigh`, `offsetLow`/`offsetHigh`
 (plus the manifest-level `version`, `count`, `dataCRC32`). They are emitted for

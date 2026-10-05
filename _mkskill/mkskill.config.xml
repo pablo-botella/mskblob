@@ -1,10 +1,10 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <mkskill>
   <version-spec params="major:byte,minor:[0-99],build:word">
-    <version major="0" minor="5" build="2" lock="major">
-      <ts></ts>
+    <version major="0" minor="5" build="3" lock="major">
+      <ts>2026-10-05T10:09:43Z</ts>
     </version>
-    <label key="title" volatile="true" default-to-ts="true"></label>
+    <label key="title" volatile="true" default-to-ts="true">2026-10-05T10:09:43Z</label>
     <create file="__publish.bat" git-ignore="true" eol="crlf">
 @echo off
 set TAG={$$$ version $$$}
@@ -22,12 +22,13 @@ exit /b 1
     <meta>
       <module>github.com/pablo-botella/mskblob</module>
       <license>MIT</license>
-      <description>Simple blob born to give support to alternate storage in https://github.com/pablo-botella/miniskin since v0.3.12 but quite generic so it's just another blob. Use when working with mskblob/CLI — the github.com/pablo-botella/mskblob Go package and `.blob` pack-file format. Covers packing many assets into one external `.blob` sidecar (kept out of the Go binary), listing/accessing and serving them at runtime, the on-disk format, and the `mskblob` CLI. Triggers on `.blob` files, the mskblob package/CLI, or "external asset blob / pack file" tasks in Go projects.</description>
+      <description>Simple blob born to give support to alternate storage in https://github.com/pablo-botella/miniskin since v0.3.12 but quite generic so it&#39;s just another blob. Use when working with mskblob/CLI — the github.com/pablo-botella/mskblob Go package and `.blob` pack-file format. Covers packing many assets into one external `.blob` sidecar (kept out of the Go binary), listing/accessing and serving them at runtime, the on-disk format, and the `mskblob` CLI. Triggers on `.blob` files, the mskblob package/CLI, or &#34;external asset blob / pack file&#34; tasks in Go projects.</description>
     </meta>
     <child-project id="cli" name="mskblob-cli" path="./cmd/mskblob" project-type="Go-CLI">
-      <embed filename="mskblob_generated_embed.go" module-name="main" embed-parent="*" embed-version="{$$$ ver:version $$$}"/>
+      <embed filename="mskblob_generated_embed.go" module-name="main" embed-parent="*" embed-version="{$$$ ver:version $$$}"></embed>
     </child-project>
   </project>
   <version-history max="10">
+    <release version="v0.5.3" ts="2026-10-05T10:09:43Z" title="2026-10-05T10:09:43Z" method="vinc-build"></release>
   </version-history>
 </mkskill>
