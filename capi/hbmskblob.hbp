@@ -1,0 +1,9 @@
+# hbmskblob.hbp — builds the Harbour wrapper as a static library (hbmskblob.lib / libhbmskblob.a).
+#   hbmk2 hbmskblob.hbp
+# Link it from a program's .hbp with: hbmskblob.hbl, or -lhbmskblob -L<this dir>
+-hblib
+-o${hb_name}
+-w3 -es2
+
+mskblob.c
+hbmskblob.c

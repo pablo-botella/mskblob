@@ -1,0 +1,9 @@
+# test_hbmskblob.hbp — builds the wrapper test as one executable, sources included.
+#   hbmk2 test_hbmskblob.hbp
+-o${hb_name}
+-w3 -es2
+-gtcgi
+
+test_hbmskblob.prg
+mskblob.c
+hbmskblob.c
