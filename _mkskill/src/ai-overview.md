@@ -32,6 +32,9 @@ go install github.com/pablo-botella/mskblob/cmd/mskblob@latest    # CLI
 - Wiring the package into an app (load + access) or a build step (pack).
 - Shipping several independently built blobs as one file: a blob can hold another,
   mounted in place with `OpenBlob` (see [Nested blobs](#nested-blobs-a-blob-inside-a-blob)).
+- Reading a blob from C or Harbour: `capi/` (C reader, `mskblob-c` tool, Harbour
+  wrapper). Readers only, on purpose: blobs are built with Go, which runs anywhere;
+  other languages just need to open them. See `capi/README.md`.
 
 The package **lists and gives content** — it finds resources for you and streams
 their bytes; it does not own a web server. The internal layout (binary format,

@@ -31,6 +31,9 @@ go install github.com/pablo-botella/mskblob/cmd/mskblob@latest    # CLI
   verifiable blobs ships as one file.
 - **One JSON manifest shape** for create / inspect / dump — human-readable, with
   hex numbers and no float-precision traps.
+- **Readable from C and Harbour** — `capi/` has a dependency-free C reader, a
+  command-line tool and a Harbour wrapper, so a blob built here can be opened by
+  programs that are not Go.
 
 `mskblob` was **born to give support to alternate storage in miniskin**
 ([`github.com/pablo-botella/miniskin`](https://pkg.go.dev/github.com/pablo-botella/miniskin)) — the

@@ -25,6 +25,9 @@ go install github.com/pablo-botella/mskblob/cmd/mskblob@latest    # CLI
   verifiable blobs ships as one file.
 - **One JSON manifest shape** for create / inspect / dump — human-readable, with
   hex numbers and no float-precision traps.
+- **Readable from C and Harbour** — `capi/` has a dependency-free C reader, a
+  command-line tool and a Harbour wrapper, so a blob built here can be opened by
+  programs that are not Go.
 
 `mskblob` was **born to give support to alternate storage in miniskin**
 ([`github.com/pablo-botella/miniskin`](https://pkg.go.dev/github.com/pablo-botella/miniskin)) — the
@@ -42,6 +45,7 @@ another blob**, fully standalone: nothing here depends on miniskin.
 - [CLI](#cli)
 - [Manifest format](#manifest-format)
 - [Binary format](#binary-format)
+- [C and Harbour readers](#c-and-harbour-readers)
 - [Design notes](#design-notes)
 - [License](#license)
 
@@ -711,6 +715,40 @@ byte 0 of the file, each entry's offset to `dataOffset`. Nothing absolute is eve
 baked in, which is why a blob stays valid wherever it lands: nesting one inside
 another copies it byte for byte, and mounting it is a single addition, with no
 relocation to patch.
+
+---
+
+## C and Harbour readers
+
+`capi/` holds a dependency-free reader for the format in plain C (C99 / C11,
+MSVC or gcc, 32 or 64 bit), a small command-line tool built on it, and a
+Harbour wrapper that exposes the reader as Harbour functions. They read a
+blob through a file mapping and give the same answers as the Go package:
+header, entries, exact and wildcard lookup, bounded sequential reads, crc32
+checks, extraction and nested blobs.
+
+They are consumers only, on purpose. There is no interest in a C or Harbour
+*writer*: the Go package and the `mskblob` CLI already build blobs and run
+anywhere, so the build step stays in Go. What other languages need is to
+*open* what Go produced — a 32-bit C program, a Harbour program — and that
+is what `capi/` does.
+
+```
+mskblob-c info|list [pattern]|verify|dump <outdir>|get <key> [outfile] <file.blob>
+```
+
+```xbase
+hBlob := MskBlobOpen( "runtime.blob" )
+aItem := MskBlobFindFirst( hBlob, "*.msi" )
+DO WHILE aItem != NIL
+   cChunk := MskBlobReadBytes( hBlob, aItem, 65536 )   // like FRead, bounded to the entry
+   ...
+   aItem := MskBlobFindNext( hBlob )
+ENDDO
+```
+
+Build and API details are in [`capi/README.md`](capi/README.md); the format
+is fully described in `mskblob.h`.
 
 ---
 

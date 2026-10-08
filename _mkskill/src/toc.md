@@ -12,6 +12,7 @@ mkskill:
 - [CLI](#cli)
 - [Manifest format](#manifest-format)
 - [Binary format](#binary-format)
+- [C and Harbour readers](#c-and-harbour-readers)
 - [Design notes](#design-notes)
 - [License](#license)
 

@@ -22,7 +22,7 @@ var mkskillSkill string
 var MkskillSpec = mkskill.Spec{
 	Name:        "mskblob",
 	Description: "Simple blob born to give support to alternate storage in https://github.com/pablo-botella/miniskin since v0.3.12 but quite generic so it's just another blob. Use when working with mskblob/CLI — the github.com/pablo-botella/mskblob Go package and `.blob` pack-file format. Covers packing many assets into one external `.blob` sidecar (kept out of the Go binary), listing/accessing and serving them at runtime, the on-disk format, and the `mskblob` CLI. Triggers on `.blob` files, the mskblob package/CLI, or \"external asset blob / pack file\" tasks in Go projects.",
-	Version:     "v0.5.3",
+	Version:     "v0.5.4",
 	Readme:      mkskillReadme,
 	Agents:      mkskillAgents,
 	Skill:       mkskillSkill,

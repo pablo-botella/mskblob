@@ -1,4 +1,6 @@
 *.exe
+*.a
+*.lib
 go.work
 go.work.sum
 __publish.bat
